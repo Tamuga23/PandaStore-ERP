@@ -1,0 +1,902 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { Upload, Plus, Trash2, Download, Wand2, FileText, Image as ImageIcon, Loader2, Package, ShoppingCart, LayoutDashboard, ClipboardList, Settings } from 'lucide-react';
+import { toJpeg } from 'html-to-image';
+import jsPDF from 'jspdf';
+import { format } from 'date-fns';
+
+import { InvoiceData, InvoiceItem, ClientData, CompanyInfo } from './types';
+import { EXCHANGE_RATE, PRODUCT_CATALOG, DEFAULT_WARRANTY_TEXT } from './constants';
+import { extractClientData } from './services/geminiService';
+import { InvoicePreview } from './components/InvoicePreview';
+import { TicketPreview } from './components/TicketPreview';
+import { ProductCatalog } from './components/ProductCatalog';
+import { PurchaseRegistration } from './components/PurchaseRegistration';
+import { InventoryView } from './components/InventoryView';
+import { CompanySettings } from './components/CompanySettings';
+
+export default function App() {
+  const [activeTab, setActiveTab] = useState<'billing' | 'catalog' | 'purchases' | 'inventory' | 'settings'>('billing');
+  const [invoiceNumber, setInvoiceNumber] = useState<number | null>(null);
+  const [date, setDate] = useState(format(new Date(), 'yyyy-MM-dd'));
+  const [mainLogo, setMainLogo] = useState<string | undefined>(undefined);
+  
+  const [clientText, setClientText] = useState('');
+  const [isExtracting, setIsExtracting] = useState(false);
+  const [isLoadingInvoice, setIsLoadingInvoice] = useState(true);
+  const [clientData, setClientData] = useState<ClientData>({
+    fullName: '',
+    address: '',
+    phone: '',
+    transport: '',
+  });
+  const [inventory, setInventory] = useState<any[]>([]);
+  const [companyInfo, setCompanyInfo] = useState<CompanyInfo | null>(null);
+
+  const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwpE5UMzvdAo89fhYQd8EVGWZctLKVSZjchGA_zFidbXYnyMadA8ukRkeKBwcYCaVIeNA/exec';
+
+  useEffect(() => {
+    fetchLatestInvoiceNumber();
+  }, []);
+
+  const fetchLatestInvoiceNumber = async () => {
+    setIsLoadingInvoice(true);
+    setFeedback(null);
+    try {
+      // Agregamos un timestamp para evitar cache y redirect: 'follow' para Google Apps Script
+      const response = await fetch(`${SCRIPT_URL}?t=${Date.now()}`, {
+        method: 'GET',
+        redirect: 'follow'
+      });
+      
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      
+      const text = await response.text();
+      let result;
+      try {
+        result = JSON.parse(text);
+      } catch (e) {
+        console.error('Response is not JSON:', text);
+        throw new Error('La respuesta del servidor no es un JSON válido. Verifica la publicación del script.');
+      }
+
+      console.log('Sync Result:', result);
+
+      if (result.status === 'success') {
+        if (result.lastInvoiceNumber !== undefined) {
+          // Extraer solo los números (ej: "A001237" -> 1237)
+          const lastNumStr = result.lastInvoiceNumber.toString().replace(/\D/g, '');
+          const lastNum = lastNumStr ? parseInt(lastNumStr) : 999;
+          setInvoiceNumber(lastNum + 1);
+        } else {
+          setInvoiceNumber(1000);
+        }
+        
+        if (result.inventory && Array.isArray(result.inventory)) {
+          setInventory(result.inventory);
+        } else if (result.catalog && Array.isArray(result.catalog)) {
+          setInventory(result.catalog);
+        } else if (result.products && Array.isArray(result.products)) {
+          setInventory(result.products);
+        }
+        
+        if (result.companyInfo) {
+          setCompanyInfo(result.companyInfo);
+        }
+
+        setFeedback({ message: 'Sincronizado con éxito', type: 'success' });
+        setTimeout(() => setFeedback(null), 3000);
+      } else {
+        setInvoiceNumber(1000);
+        setFeedback({ message: 'No se encontraron registros previos. Iniciando en 1000.', type: 'error' });
+      }
+    } catch (error) {
+      console.error('Error fetching latest invoice number:', error);
+      setInvoiceNumber(1000);
+      setFeedback({ 
+        message: 'Error de conexión con Google Sheets. Asegúrate de que el script esté publicado como "Cualquier persona".', 
+        type: 'error' 
+      });
+    } finally {
+      setIsLoadingInvoice(false);
+    }
+  };
+
+  const [items, setItems] = useState<InvoiceItem[]>([]);
+  const [shippingCostNIO, setShippingCostNIO] = useState(0);
+  const [discountNIO, setDiscountNIO] = useState(0);
+  const [customNote, setCustomNote] = useState('');
+  const [warrantyText, setWarrantyText] = useState(DEFAULT_WARRANTY_TEXT);
+
+  const [isGeneratingPDF, setIsGeneratingPDF] = useState(false);
+  const [previewMode, setPreviewMode] = useState<'invoice' | 'ticket'>('invoice');
+  const [feedback, setFeedback] = useState<{message: string, type: 'success' | 'error'} | null>(null);
+  const previewRef = useRef<HTMLDivElement>(null);
+  const ticketPreviewRef = useRef<HTMLDivElement>(null);
+
+  const handleExtractClientData = async () => {
+    if (!clientText.trim()) return;
+    setIsExtracting(true);
+    try {
+      const extracted = await extractClientData(clientText);
+      setClientData(extracted);
+    } catch (error) {
+      alert('Error al extraer datos. Por favor, revisa tu conexión o intenta manualmente.');
+    } finally {
+      setIsExtracting(false);
+    }
+  };
+
+  const handleAddItem = () => {
+    const newItem: InvoiceItem = {
+      id: Date.now().toString(),
+      productId: '',
+      productName: '',
+      quantity: 1,
+      priceNIO: 0,
+      priceUSD: 0,
+    };
+    setItems([...items, newItem]);
+  };
+
+  const handleRemoveItem = (id: string) => {
+    setItems(items.filter(item => item.id !== id));
+  };
+
+  const handleItemChange = (id: string, field: keyof InvoiceItem, value: any) => {
+    setItems(items.map(item => {
+      if (item.id === id) {
+        let finalValue = value;
+        
+        // Validate quantity
+        if (field === 'quantity') {
+          finalValue = Math.max(1, parseInt(value) || 1);
+        }
+        
+        // Validate prices
+        if (field === 'priceNIO' || field === 'priceUSD') {
+          const parsed = parseFloat(value);
+          if (!isNaN(parsed) && parsed < 0) {
+            finalValue = 0;
+          }
+        }
+
+        const updatedItem = { ...item, [field]: finalValue };
+        
+        // Auto-fill product name and default price when selecting a product
+        if (field === 'productId') {
+          // Try to find in dynamic inventory first, fallback to static catalog
+          const dynamicProduct = inventory.find(p => p.id === value || p.ID === value);
+          const staticProduct = PRODUCT_CATALOG.find(p => p.id === value);
+          
+          if (dynamicProduct) {
+            updatedItem.productName = dynamicProduct.description || dynamicProduct.Description || dynamicProduct.name || dynamicProduct.Name || '';
+            const priceUSD = parseFloat(dynamicProduct.priceUSD || dynamicProduct['Precio USD'] || dynamicProduct.price || 0);
+            updatedItem.priceUSD = Math.max(0, priceUSD);
+            updatedItem.priceNIO = Math.max(0, parseFloat((priceUSD * EXCHANGE_RATE).toFixed(2)));
+            if (dynamicProduct.image || dynamicProduct.Image || dynamicProduct.imagen || dynamicProduct.Imagen) {
+              updatedItem.image = dynamicProduct.image || dynamicProduct.Image || dynamicProduct.imagen || dynamicProduct.Imagen;
+            }
+          } else if (staticProduct) {
+            updatedItem.productName = staticProduct.name;
+            updatedItem.priceUSD = Math.max(0, staticProduct.defaultPriceUSD);
+            updatedItem.priceNIO = Math.max(0, parseFloat((staticProduct.defaultPriceUSD * EXCHANGE_RATE).toFixed(2)));
+          }
+        }
+        
+        // Auto-calculate USD when NIO changes
+        if (field === 'priceNIO') {
+          const nio = parseFloat(finalValue);
+          if (!isNaN(nio)) {
+            updatedItem.priceUSD = parseFloat((nio / EXCHANGE_RATE).toFixed(2));
+          }
+        }
+        
+        // Auto-calculate NIO when USD changes
+        if (field === 'priceUSD') {
+          const usd = parseFloat(finalValue);
+          if (!isNaN(usd)) {
+            updatedItem.priceNIO = parseFloat((usd * EXCHANGE_RATE).toFixed(2));
+          }
+        }
+
+        return updatedItem;
+      }
+      return item;
+    }));
+  };
+
+  const handleItemImageUpload = (id: string, e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        handleItemChange(id, 'image', reader.result as string);
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
+  const invoiceData: InvoiceData = {
+    invoiceNumber: invoiceNumber ? `A${invoiceNumber.toString().padStart(6, '0')}` : 'Cargando...',
+    date: date.split('-').reverse().join('/'),
+    client: clientData,
+    items,
+    shippingCostNIO,
+    discountNIO,
+    customNote,
+    warrantyText,
+    mainLogo: companyInfo?.logo || mainLogo,
+    companyInfo: companyInfo || undefined,
+  };
+
+  const registerSaleInExcel = async (data: InvoiceData) => {
+    try {
+      // Remover el signo '+' del teléfono para evitar errores en Google Sheets
+      const dataToSend = {
+        ...data,
+        client: {
+          ...data.client,
+          phone: data.client.phone.replace(/\+/g, '')
+        }
+      };
+
+      const response = await fetch(SCRIPT_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'text/plain;charset=utf-8',
+        },
+        body: JSON.stringify(dataToSend),
+        redirect: 'follow' // Importante para Google Apps Script
+      });
+      
+      // Leemos la respuesta como texto primero para poder depurar si no es JSON
+      const responseText = await response.text();
+      console.log("Respuesta cruda de Google Apps Script:", responseText);
+
+      let result;
+      try {
+        result = JSON.parse(responseText);
+      } catch (parseError) {
+        console.error("Error al parsear JSON. La respuesta del servidor no es JSON válido.");
+        setFeedback({ message: 'PDF guardado, pero falló el registro (Respuesta inválida)', type: 'error' });
+        setTimeout(() => setFeedback(null), 5000);
+        return;
+      }
+
+      if (result.status === 'success') {
+        setFeedback({ message: 'PDF generado y venta registrada en Excel', type: 'success' });
+        // Sincronizar de nuevo con el servidor para asegurar el siguiente número
+        fetchLatestInvoiceNumber();
+      } else {
+        console.error("El script devolvió un error:", result);
+        setFeedback({ message: 'PDF guardado, pero falló el registro en Excel', type: 'error' });
+      }
+    } catch (error) {
+      console.error('Error de red o CORS al registrar la venta:', error);
+      setFeedback({ message: 'PDF guardado, pero falló el registro en Excel', type: 'error' });
+    }
+    setTimeout(() => setFeedback(null), 5000);
+  };
+
+  const incrementConsecutiveCode = () => {
+    setInvoiceNumber(prev => prev !== null ? prev + 1 : null);
+  };
+
+  const handleDownloadPDF = async () => {
+    if (!previewRef.current) return;
+    setIsGeneratingPDF(true);
+    setFeedback(null);
+    
+    try {
+      const pages = previewRef.current.querySelectorAll('.invoice-page');
+      const pdf = new jsPDF('p', 'mm', 'a4');
+      
+      for (let i = 0; i < pages.length; i++) {
+        const page = pages[i] as HTMLElement;
+        // Usamos JPEG con calidad 0.8 y pixelRatio 1.5 para reducir drásticamente el peso
+        const dataUrl = await toJpeg(page, { 
+          quality: 0.8, 
+          pixelRatio: 1.5,
+          backgroundColor: '#ffffff' 
+        });
+        
+        const pdfWidth = pdf.internal.pageSize.getWidth();
+        const pdfHeight = (page.offsetHeight * pdfWidth) / page.offsetWidth;
+        
+        if (i > 0) {
+          pdf.addPage();
+        }
+        // Usamos compresión FAST para el PDF
+        pdf.addImage(dataUrl, 'JPEG', 0, 0, pdfWidth, pdfHeight, undefined, 'FAST');
+      }
+      
+      const formattedName = clientData.fullName.trim() ? `-${clientData.fullName.trim().replace(/\s+/g, '-')}` : '';
+      pdf.save(`Factura-${invoiceNumber}${formattedName}.pdf`);
+      await registerSaleInExcel(invoiceData);
+    } catch (error) {
+      console.error('Error generating PDF:', error);
+      alert('Hubo un error al generar el PDF.');
+    } finally {
+      incrementConsecutiveCode();
+      setIsGeneratingPDF(false);
+    }
+  };
+
+  const handleDownloadTicketPDF = async () => {
+    if (!ticketPreviewRef.current) return;
+    setIsGeneratingPDF(true);
+    setFeedback(null);
+    
+    try {
+      const ticketElement = ticketPreviewRef.current;
+      // Usamos JPEG con calidad 0.8 y pixelRatio 1.5 para reducir drásticamente el peso
+      const dataUrl = await toJpeg(ticketElement, { 
+        quality: 0.8, 
+        pixelRatio: 1.5,
+        backgroundColor: '#ffffff'
+      });
+      
+      const mmWidth = 100; // 4 inches is ~101.6mm, 100mm is standard for wide thermal
+      const pxWidth = ticketElement.offsetWidth;
+      const pxHeight = ticketElement.offsetHeight;
+      const mmHeight = (pxHeight * mmWidth) / pxWidth;
+      
+      const pdf = new jsPDF({
+        orientation: 'p',
+        unit: 'mm',
+        format: [mmWidth, mmHeight]
+      });
+      
+      pdf.addImage(dataUrl, 'JPEG', 0, 0, mmWidth, mmHeight, undefined, 'FAST');
+      const formattedName = clientData.fullName.trim() ? `-${clientData.fullName.trim().replace(/\s+/g, '-')}` : '';
+      pdf.save(`Ticket-${invoiceNumber}${formattedName}.pdf`);
+      await registerSaleInExcel(invoiceData);
+    } catch (error) {
+      console.error('Error generating Ticket PDF:', error);
+      alert('Hubo un error al generar el Ticket.');
+    } finally {
+      incrementConsecutiveCode();
+      setIsGeneratingPDF(false);
+    }
+  };
+
+  const handleResetForm = () => {
+    if (window.confirm('¿Estás seguro de que deseas limpiar todo el formulario? Se perderán todos los datos no guardados.')) {
+      setDate(format(new Date(), 'yyyy-MM-dd'));
+      setClientText('');
+      setClientData({ fullName: '', address: '', phone: '', transport: '' });
+      setItems([]);
+      setShippingCostNIO(0);
+      setDiscountNIO(0);
+      setCustomNote('');
+      setWarrantyText(DEFAULT_WARRANTY_TEXT);
+      setFeedback(null);
+    }
+  };
+
+  const renderBilling = () => (
+    <div className="flex flex-col lg:flex-row min-h-screen lg:h-[calc(100vh-64px)] bg-gray-50 lg:overflow-hidden font-sans">
+      {/* Left Panel: Controls */}
+      <div className="w-full lg:w-1/2 h-auto lg:h-full overflow-y-auto border-b lg:border-b-0 lg:border-r border-gray-200 bg-white p-4 lg:p-6 shadow-sm z-10">
+        <div className="flex items-center justify-between mb-8 pb-4 border-b border-gray-100">
+          <div className="flex items-center gap-3">
+            <div className="bg-blue-600 p-2 rounded-lg">
+              <FileText className="w-6 h-6 text-white" />
+            </div>
+            <h1 className="text-xl lg:text-2xl font-bold text-gray-800 tracking-tight">Generador de Facturas</h1>
+          </div>
+          <button
+            onClick={handleResetForm}
+            className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-red-600 bg-red-50 hover:bg-red-100 rounded-lg transition-colors border border-red-100"
+            title="Limpiar formulario"
+          >
+            <Trash2 className="w-4 h-4" />
+            Limpiar
+          </button>
+        </div>
+
+        {/* General Info */}
+        <section className="mb-8 bg-gray-50 p-5 rounded-xl border border-gray-100">
+          <h2 className="text-lg font-semibold text-gray-800 mb-4 flex items-center gap-2">
+            <span className="bg-blue-100 text-blue-700 w-6 h-6 rounded-full flex items-center justify-center text-sm">1</span>
+            Información General
+          </h2>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
+            <div>
+              <div className="flex justify-between items-center mb-1">
+                <label className="block text-sm font-medium text-gray-700">Nº Factura</label>
+                <button 
+                  onClick={fetchLatestInvoiceNumber}
+                  disabled={isLoadingInvoice}
+                  className="text-[10px] font-bold text-blue-600 hover:text-blue-800 flex items-center gap-1 uppercase tracking-wider disabled:opacity-50"
+                >
+                  <Wand2 className={`w-3 h-3 ${isLoadingInvoice ? 'animate-spin' : ''}`} />
+                  {isLoadingInvoice ? 'Sincronizando...' : 'Sincronizar'}
+                </button>
+              </div>
+              <div className="flex items-center">
+                <span className="bg-gray-100 border border-r-0 border-gray-300 px-3 py-2 rounded-l-md text-gray-500 font-bold">A</span>
+                <input 
+                  type="number" 
+                  value={invoiceNumber || ''} 
+                  onChange={(e) => setInvoiceNumber(parseInt(e.target.value) || 0)}
+                  disabled={isLoadingInvoice}
+                  className="w-full border border-gray-300 rounded-r-md p-2 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all disabled:bg-gray-50 font-bold text-blue-700"
+                  placeholder={isLoadingInvoice ? "Cargando..." : ""}
+                />
+              </div>
+              {isLoadingInvoice && <p className="text-[10px] text-blue-600 mt-1 animate-pulse">Consultando base de datos en Google Sheets...</p>}
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Fecha</label>
+              <input 
+                type="date" 
+                value={date} 
+                onChange={(e) => setDate(e.target.value)}
+                className="w-full border border-gray-300 rounded-md p-2 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all"
+              />
+            </div>
+          </div>
+        </section>
+
+        {/* Client Data & AI */}
+        <section className="mb-8 bg-blue-50/50 p-5 rounded-xl border border-blue-100">
+          <h2 className="text-lg font-semibold text-gray-800 mb-4 flex items-center gap-2">
+            <span className="bg-blue-100 text-blue-700 w-6 h-6 rounded-full flex items-center justify-center text-sm">2</span>
+            Datos del Cliente
+          </h2>
+          
+          <div className="mb-6 bg-white p-4 rounded-lg border border-blue-200 shadow-sm">
+            <label className="block text-sm font-medium text-gray-700 mb-2 flex items-center gap-2">
+              <Wand2 className="w-4 h-4 text-purple-500" />
+              Extracción Inteligente (IA)
+            </label>
+            <textarea 
+              value={clientText}
+              onChange={(e) => setClientText(e.target.value)}
+              placeholder="Pega aquí los datos desordenados del cliente (ej: Juan Pérez, vive en Linda Vista, tel 8888-8888, mandar por CargoTrans)"
+              className="w-full border border-gray-300 rounded-md p-3 h-24 text-sm focus:ring-2 focus:ring-purple-500 focus:border-purple-500 outline-none transition-all resize-none"
+            />
+            <button 
+              onClick={handleExtractClientData}
+              disabled={isExtracting || !clientText.trim()}
+              className="mt-3 flex items-center justify-center gap-2 w-full bg-purple-600 hover:bg-purple-700 disabled:bg-purple-300 text-white py-2 px-4 rounded-md font-medium transition-colors shadow-sm"
+            >
+              {isExtracting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wand2 className="w-4 h-4" />}
+              {isExtracting ? 'Extrayendo...' : 'Extraer Datos con IA'}
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="col-span-1 sm:col-span-2">
+              <label className="block text-sm font-medium text-gray-700 mb-1">Nombre Completo</label>
+              <input 
+                type="text" 
+                value={clientData.fullName} 
+                onChange={(e) => setClientData({...clientData, fullName: e.target.value})}
+                className="w-full border border-gray-300 rounded-md p-2 focus:ring-2 focus:ring-blue-500 outline-none"
+              />
+            </div>
+            <div className="col-span-1 sm:col-span-2">
+              <label className="block text-sm font-medium text-gray-700 mb-1">Dirección</label>
+              <input 
+                type="text" 
+                value={clientData.address} 
+                onChange={(e) => setClientData({...clientData, address: e.target.value})}
+                className="w-full border border-gray-300 rounded-md p-2 focus:ring-2 focus:ring-blue-500 outline-none"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Teléfono</label>
+              <input 
+                type="text" 
+                value={clientData.phone} 
+                onChange={(e) => setClientData({...clientData, phone: e.target.value})}
+                className="w-full border border-gray-300 rounded-md p-2 focus:ring-2 focus:ring-blue-500 outline-none"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Transporte</label>
+              <input 
+                type="text" 
+                value={clientData.transport} 
+                onChange={(e) => setClientData({...clientData, transport: e.target.value})}
+                className="w-full border border-gray-300 rounded-md p-2 focus:ring-2 focus:ring-blue-500 outline-none"
+              />
+            </div>
+          </div>
+        </section>
+
+        {/* Items */}
+        <section className="mb-8">
+          <div className="flex justify-between items-center mb-4">
+            <h2 className="text-lg font-semibold text-gray-800 flex items-center gap-2">
+              <span className="bg-blue-100 text-blue-700 w-6 h-6 rounded-full flex items-center justify-center text-sm">3</span>
+              Artículos
+            </h2>
+            <button 
+              onClick={handleAddItem}
+              className="flex items-center gap-1 text-sm bg-blue-50 text-blue-600 hover:bg-blue-100 px-3 py-1.5 rounded-md font-medium transition-colors"
+            >
+              <Plus className="w-4 h-4" /> Agregar Artículo
+            </button>
+          </div>
+
+          <div className="space-y-4">
+            {items.map((item, index) => (
+              <div key={item.id} className="bg-white border border-gray-200 p-4 rounded-xl shadow-sm relative group">
+                <button 
+                  onClick={() => handleRemoveItem(item.id)}
+                  className="absolute -top-2 -right-2 bg-red-100 text-red-600 p-1.5 rounded-full opacity-0 group-hover:opacity-100 transition-opacity hover:bg-red-200 shadow-sm"
+                  title="Eliminar artículo"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+                
+                <div className="grid grid-cols-12 gap-4">
+                  <div className="col-span-12 md:col-span-6">
+                    <label className="block text-xs font-medium text-gray-500 mb-1 uppercase tracking-wider">Producto</label>
+                    <select 
+                      value={item.productId}
+                      onChange={(e) => handleItemChange(item.id, 'productId', e.target.value)}
+                      className="w-full border border-gray-300 rounded-md p-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none mb-2"
+                    >
+                      <option value="">Seleccionar producto...</option>
+                      {inventory.length > 0 ? (
+                        inventory
+                          .filter(p => {
+                            const stock = parseInt(p.stock || p.Stock || p.cantidad || 0);
+                            const status = p.status || p.Status || p.estado || p.Estado;
+                            return stock > 0 && (status === 'Activo' || status === 'activo');
+                          })
+                          .map(p => {
+                            const id = p.id || p.ID;
+                            const name = p.description || p.Description || p.name || p.Name;
+                            const stock = p.stock || p.Stock || p.cantidad || 0;
+                            return (
+                              <option key={id} value={id}>
+                                {id} - {name} (Stock: {stock})
+                              </option>
+                            );
+                          })
+                      ) : (
+                        PRODUCT_CATALOG.map(p => (
+                          <option key={p.id} value={p.id}>{p.name}</option>
+                        ))
+                      )}
+                    </select>
+                    <input 
+                      type="text" 
+                      value={item.productName}
+                      onChange={(e) => handleItemChange(item.id, 'productName', e.target.value)}
+                      placeholder="Nombre personalizado..."
+                      className="w-full border border-gray-300 rounded-md p-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none"
+                    />
+                  </div>
+                  
+                  <div className="col-span-4 md:col-span-2">
+                    <label className="block text-xs font-medium text-gray-500 mb-1 uppercase tracking-wider">Cant.</label>
+                    <input 
+                      type="number" 
+                      min="1"
+                      value={item.quantity}
+                      onChange={(e) => handleItemChange(item.id, 'quantity', parseInt(e.target.value) || 1)}
+                      className="w-full border border-gray-300 rounded-md p-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none"
+                    />
+                  </div>
+                  
+                  <div className="col-span-4 md:col-span-2">
+                    <label className="block text-xs font-medium text-gray-500 mb-1 uppercase tracking-wider">Precio C$</label>
+                    <input 
+                      type="number" 
+                      min="0"
+                      step="0.01"
+                      value={item.priceNIO || ''}
+                      onChange={(e) => handleItemChange(item.id, 'priceNIO', e.target.value)}
+                      className="w-full border border-gray-300 rounded-md p-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none"
+                    />
+                  </div>
+                  
+                  <div className="col-span-4 md:col-span-2">
+                    <label className="block text-xs font-medium text-gray-500 mb-1 uppercase tracking-wider">Precio $</label>
+                    <input 
+                      type="number" 
+                      min="0"
+                      step="0.01"
+                      value={item.priceUSD || ''}
+                      onChange={(e) => handleItemChange(item.id, 'priceUSD', e.target.value)}
+                      className="w-full border border-gray-300 rounded-md p-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none"
+                    />
+                  </div>
+                </div>
+                
+                <div className="mt-3 flex items-center gap-3">
+                  <label className="flex items-center gap-1.5 text-xs font-medium text-gray-600 bg-gray-100 hover:bg-gray-200 px-3 py-1.5 rounded cursor-pointer transition-colors">
+                    <ImageIcon className="w-3.5 h-3.5" />
+                    {item.image ? 'Cambiar Foto' : 'Añadir Foto'}
+                    <input type="file" accept="image/*" onChange={(e) => handleItemImageUpload(item.id, e)} className="hidden" />
+                  </label>
+                  {item.image && <span className="text-xs text-green-600 flex items-center gap-1">✓ Foto añadida</span>}
+                </div>
+              </div>
+            ))}
+            {items.length === 0 && (
+              <div className="text-center py-8 bg-gray-50 border border-dashed border-gray-300 rounded-xl">
+                <p className="text-gray-500 text-sm">No hay artículos en la factura.</p>
+                <button 
+                  onClick={handleAddItem}
+                  className="mt-2 text-blue-600 text-sm font-medium hover:underline"
+                >
+                  Agregar el primer artículo
+                </button>
+              </div>
+            )}
+          </div>
+        </section>
+
+        {/* Totals & Notes */}
+        <section className="mb-8 bg-gray-50 p-5 rounded-xl border border-gray-100">
+          <h2 className="text-lg font-semibold text-gray-800 mb-4 flex items-center gap-2">
+            <span className="bg-blue-100 text-blue-700 w-6 h-6 rounded-full flex items-center justify-center text-sm">4</span>
+            Totales y Notas
+          </h2>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 lg:gap-6">
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Costo de Envío (C$)</label>
+                <input 
+                  type="number" 
+                  value={shippingCostNIO || ''} 
+                  onChange={(e) => setShippingCostNIO(parseFloat(e.target.value) || 0)}
+                  className="w-full border border-gray-300 rounded-md p-2 focus:ring-2 focus:ring-blue-500 outline-none"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Descuento (C$)</label>
+                <input 
+                  type="number" 
+                  value={discountNIO || ''} 
+                  onChange={(e) => setDiscountNIO(parseFloat(e.target.value) || 0)}
+                  className="w-full border border-gray-300 rounded-md p-2 focus:ring-2 focus:ring-blue-500 outline-none"
+                />
+              </div>
+            </div>
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Nota Personalizada</label>
+                <textarea 
+                  value={customNote} 
+                  onChange={(e) => setCustomNote(e.target.value)}
+                  placeholder="Ej: Se entrega MicroSD Clase 10 de 32GB"
+                  className="w-full border border-gray-300 rounded-md p-2 h-20 text-sm focus:ring-2 focus:ring-blue-500 outline-none resize-none"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Texto de Garantía</label>
+                <textarea 
+                  value={warrantyText} 
+                  onChange={(e) => setWarrantyText(e.target.value)}
+                  className="w-full border border-gray-300 rounded-md p-2 h-20 text-sm focus:ring-2 focus:ring-blue-500 outline-none resize-none"
+                />
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* Actions */}
+        <div className="sticky bottom-0 bg-white pt-4 pb-6 border-t border-gray-200 mt-8 flex flex-col gap-3">
+          <button 
+            onClick={handleDownloadPDF}
+            disabled={isGeneratingPDF || items.length === 0 || isLoadingInvoice}
+            className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white py-3 px-4 rounded-xl font-bold text-lg flex items-center justify-center gap-2 transition-colors shadow-md"
+          >
+            {isGeneratingPDF ? <Loader2 className="w-6 h-6 animate-spin" /> : <Download className="w-6 h-6" />}
+            Descargar Factura (A4)
+          </button>
+          <button 
+            onClick={handleDownloadTicketPDF}
+            disabled={isGeneratingPDF || items.length === 0 || isLoadingInvoice}
+            className="w-full bg-gray-800 hover:bg-gray-900 disabled:bg-gray-400 text-white py-3 px-4 rounded-xl font-bold text-lg flex items-center justify-center gap-2 transition-colors shadow-md"
+          >
+            {isGeneratingPDF ? <Loader2 className="w-6 h-6 animate-spin" /> : <Download className="w-6 h-6" />}
+            Descargar Ticket (4")
+          </button>
+        </div>
+      </div>
+
+      {/* Right Panel: Live Preview */}
+      <div className="w-full lg:w-1/2 h-auto lg:h-full overflow-y-auto bg-gray-200 flex flex-col items-center p-4 lg:p-8">
+        {/* Toggle */}
+        <div className="bg-white p-1 rounded-lg shadow-sm mb-6 flex gap-1 z-10 w-full sm:w-auto justify-center">
+          <button 
+            onClick={() => setPreviewMode('invoice')}
+            className={`flex-1 sm:flex-none px-4 py-2 rounded-md text-sm font-medium transition-colors ${previewMode === 'invoice' ? 'bg-blue-100 text-blue-700' : 'text-gray-600 hover:bg-gray-50'}`}
+          >
+            Vista Factura (A4)
+          </button>
+          <button 
+            onClick={() => setPreviewMode('ticket')}
+            className={`flex-1 sm:flex-none px-4 py-2 rounded-md text-sm font-medium transition-colors ${previewMode === 'ticket' ? 'bg-gray-800 text-white' : 'text-gray-600 hover:bg-gray-50'}`}
+          >
+            Vista Ticket (4")
+          </button>
+        </div>
+
+        <div className="transform origin-top scale-90 xl:scale-100 transition-transform w-full flex justify-center">
+          {/* We wrap InvoicePreview in a div to apply scaling for smaller screens without affecting the actual render size for PDF */}
+          <div className={previewMode === 'invoice' ? 'block' : 'absolute -left-[9999px] opacity-0 pointer-events-none'}>
+            <InvoicePreview data={invoiceData} ref={previewRef} />
+          </div>
+          <div className={previewMode === 'ticket' ? 'block' : 'absolute -left-[9999px] opacity-0 pointer-events-none'}>
+            <TicketPreview data={invoiceData} ref={ticketPreviewRef} />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="min-h-screen bg-gray-50 flex flex-col font-sans">
+      {feedback && (
+        <div className={`fixed top-6 right-6 p-4 rounded-xl shadow-xl z-50 text-white font-medium transition-all flex items-center gap-2 ${feedback.type === 'success' ? 'bg-green-600' : 'bg-red-600'}`}>
+          {feedback.message}
+        </div>
+      )}
+
+      {/* Top Navigation */}
+      <header className="bg-white border-b border-gray-200 shadow-sm z-20">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="flex justify-between h-16">
+            <div className="flex">
+              <div className="flex-shrink-0 flex items-center gap-2">
+                <div className="bg-blue-600 p-1.5 rounded-lg">
+                  <LayoutDashboard className="w-5 h-5 text-white" />
+                </div>
+                <span className="font-bold text-xl text-gray-800">PandaStore ERP</span>
+              </div>
+              <div className="hidden sm:ml-6 sm:flex sm:space-x-8">
+                <button
+                  onClick={() => setActiveTab('billing')}
+                  className={`${
+                    activeTab === 'billing'
+                      ? 'border-blue-500 text-gray-900'
+                      : 'border-transparent text-gray-500 hover:border-gray-300 hover:text-gray-700'
+                  } inline-flex items-center px-1 pt-1 border-b-2 text-sm font-medium transition-colors`}
+                >
+                  <FileText className="w-4 h-4 mr-2" />
+                  Facturación
+                </button>
+                <button
+                  onClick={() => setActiveTab('catalog')}
+                  className={`${
+                    activeTab === 'catalog'
+                      ? 'border-green-500 text-gray-900'
+                      : 'border-transparent text-gray-500 hover:border-gray-300 hover:text-gray-700'
+                  } inline-flex items-center px-1 pt-1 border-b-2 text-sm font-medium transition-colors`}
+                >
+                  <Package className="w-4 h-4 mr-2" />
+                  Catálogo
+                </button>
+                <button
+                  onClick={() => setActiveTab('purchases')}
+                  className={`${
+                    activeTab === 'purchases'
+                      ? 'border-orange-500 text-gray-900'
+                      : 'border-transparent text-gray-500 hover:border-gray-300 hover:text-gray-700'
+                  } inline-flex items-center px-1 pt-1 border-b-2 text-sm font-medium transition-colors`}
+                >
+                  <ShoppingCart className="w-4 h-4 mr-2" />
+                  Compras
+                </button>
+                <button
+                  onClick={() => setActiveTab('inventory')}
+                  className={`${
+                    activeTab === 'inventory'
+                      ? 'border-indigo-500 text-gray-900'
+                      : 'border-transparent text-gray-500 hover:border-gray-300 hover:text-gray-700'
+                  } inline-flex items-center px-1 pt-1 border-b-2 text-sm font-medium transition-colors`}
+                >
+                  <ClipboardList className="w-4 h-4 mr-2" />
+                  Inventario
+                </button>
+                <button
+                  onClick={() => setActiveTab('settings')}
+                  className={`${
+                    activeTab === 'settings'
+                      ? 'border-slate-500 text-gray-900'
+                      : 'border-transparent text-gray-500 hover:border-gray-300 hover:text-gray-700'
+                  } inline-flex items-center px-1 pt-1 border-b-2 text-sm font-medium transition-colors`}
+                >
+                  <Settings className="w-4 h-4 mr-2" />
+                  Configuración
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+        
+        {/* Mobile Navigation */}
+        <div className="sm:hidden border-t border-gray-200 overflow-x-auto">
+          <div className="flex justify-start min-w-max p-2 gap-2">
+            <button
+              onClick={() => setActiveTab('billing')}
+              className={`${
+                activeTab === 'billing' ? 'text-blue-600 bg-blue-50' : 'text-gray-500 hover:bg-gray-50'
+              } flex-1 flex flex-col items-center py-2 px-4 rounded-md text-xs font-medium`}
+            >
+              <FileText className="w-5 h-5 mb-1" />
+              Facturación
+            </button>
+            <button
+              onClick={() => setActiveTab('catalog')}
+              className={`${
+                activeTab === 'catalog' ? 'text-green-600 bg-green-50' : 'text-gray-500 hover:bg-gray-50'
+              } flex-1 flex flex-col items-center py-2 px-4 rounded-md text-xs font-medium`}
+            >
+              <Package className="w-5 h-5 mb-1" />
+              Catálogo
+            </button>
+            <button
+              onClick={() => setActiveTab('purchases')}
+              className={`${
+                activeTab === 'purchases' ? 'text-orange-600 bg-orange-50' : 'text-gray-500 hover:bg-gray-50'
+              } flex-1 flex flex-col items-center py-2 px-4 rounded-md text-xs font-medium`}
+            >
+              <ShoppingCart className="w-5 h-5 mb-1" />
+              Compras
+            </button>
+            <button
+              onClick={() => setActiveTab('inventory')}
+              className={`${
+                activeTab === 'inventory' ? 'text-indigo-600 bg-indigo-50' : 'text-gray-500 hover:bg-gray-50'
+              } flex-1 flex flex-col items-center py-2 px-4 rounded-md text-xs font-medium`}
+            >
+              <ClipboardList className="w-5 h-5 mb-1" />
+              Inventario
+            </button>
+            <button
+              onClick={() => setActiveTab('settings')}
+              className={`${
+                activeTab === 'settings' ? 'text-slate-600 bg-slate-50' : 'text-gray-500 hover:bg-gray-50'
+              } flex-1 flex flex-col items-center py-2 px-4 rounded-md text-xs font-medium`}
+            >
+              <Settings className="w-5 h-5 mb-1" />
+              Configuración
+            </button>
+          </div>
+        </div>
+      </header>
+
+      {/* Main Content */}
+      <main className="flex-1 overflow-hidden flex flex-col">
+        {activeTab === 'billing' && renderBilling()}
+        {activeTab === 'catalog' && (
+          <div className="p-4 sm:p-6 lg:p-8 max-w-4xl mx-auto w-full overflow-y-auto">
+            <ProductCatalog scriptUrl={SCRIPT_URL} inventory={inventory} onSuccess={fetchLatestInvoiceNumber} />
+          </div>
+        )}
+        {activeTab === 'purchases' && (
+          <div className="p-4 sm:p-6 lg:p-8 max-w-4xl mx-auto w-full overflow-y-auto">
+            <PurchaseRegistration scriptUrl={SCRIPT_URL} inventory={inventory} onSuccess={fetchLatestInvoiceNumber} />
+          </div>
+        )}
+        {activeTab === 'inventory' && (
+          <div className="p-4 sm:p-6 lg:p-8 max-w-5xl mx-auto w-full overflow-y-auto">
+            <InventoryView 
+              inventory={inventory} 
+              isLoading={isLoadingInvoice} 
+              onRefresh={fetchLatestInvoiceNumber} 
+            />
+          </div>
+        )}
+        {activeTab === 'settings' && (
+          <div className="p-4 sm:p-6 lg:p-8 max-w-4xl mx-auto w-full overflow-y-auto">
+            <CompanySettings scriptUrl={SCRIPT_URL} initialData={companyInfo} onSuccess={fetchLatestInvoiceNumber} />
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
