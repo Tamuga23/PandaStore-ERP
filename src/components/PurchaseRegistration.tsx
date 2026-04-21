@@ -13,6 +13,7 @@ export function PurchaseRegistration({ scriptUrl, inventory, onSuccess }: Purcha
   const [feedback, setFeedback] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
   const [isNewProduct, setIsNewProduct] = useState(false);
   const [isCustomCategory, setIsCustomCategory] = useState(false);
+  const [isCustomSupplier, setIsCustomSupplier] = useState(false);
 
   const existingCategories = Array.from(new Set(
     inventory
@@ -366,16 +367,49 @@ export function PurchaseRegistration({ scriptUrl, inventory, onSuccess }: Purcha
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Proveedor</label>
-            <select
-              name="supplier"
-              required
-              value={formData.supplier}
-              onChange={handleChange}
-              className="w-full border border-gray-300 rounded-md p-2 focus:ring-2 focus:ring-orange-500 outline-none"
-            >
-              <option value="">Seleccionar proveedor...</option>
-              {SUPPLIERS.map((s, i) => <option key={i} value={s}>{s}</option>)}
-            </select>
+            {!isCustomSupplier ? (
+              <select
+                name="supplier"
+                required
+                value={formData.supplier}
+                onChange={(e) => {
+                  if (e.target.value === 'NEW_SUPPLIER') {
+                    setIsCustomSupplier(true);
+                    setFormData(prev => ({ ...prev, supplier: '' }));
+                  } else {
+                    handleChange(e);
+                  }
+                }}
+                className="w-full border border-gray-300 rounded-md p-2 focus:ring-2 focus:ring-orange-500 outline-none"
+              >
+                <option value="">Seleccionar proveedor...</option>
+                {SUPPLIERS.map((s, i) => <option key={i} value={s}>{s}</option>)}
+                <option value="NEW_SUPPLIER" className="font-semibold text-orange-600">+ Agregar nuevo proveedor</option>
+              </select>
+            ) : (
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  name="supplier"
+                  required
+                  value={formData.supplier}
+                  onChange={handleChange}
+                  className="w-full border border-gray-300 rounded-md p-2 focus:ring-2 focus:ring-orange-500 outline-none"
+                  placeholder="Nombre del nuevo proveedor..."
+                  autoFocus
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsCustomSupplier(false);
+                    setFormData(prev => ({ ...prev, supplier: '' }));
+                  }}
+                  className="px-3 py-2 text-sm text-gray-500 hover:text-gray-700 border border-gray-300 rounded-md hover:bg-gray-50 transition-colors"
+                >
+                  Cancelar
+                </button>
+              </div>
+            )}
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Plataforma</label>

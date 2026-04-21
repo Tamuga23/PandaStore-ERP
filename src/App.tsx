@@ -751,10 +751,14 @@ export default function App() {
           <div className="flex justify-between h-16">
             <div className="flex">
               <div className="flex-shrink-0 flex items-center gap-2">
-                <div className="bg-blue-600 p-1.5 rounded-lg">
-                  <LayoutDashboard className="w-5 h-5 text-white" />
-                </div>
-                <span className="font-bold text-xl text-gray-800">PandaStore ERP</span>
+                {companyInfo?.logo ? (
+                  <img src={companyInfo.logo} alt="Logo" className="w-8 h-8 object-contain rounded-md" />
+                ) : (
+                  <div className="bg-blue-600 p-1.5 rounded-lg">
+                    <LayoutDashboard className="w-5 h-5 text-white" />
+                  </div>
+                )}
+                <span className="font-bold text-xl text-gray-800">{companyInfo?.name || 'PandaStore ERP'}</span>
               </div>
               <div className="hidden sm:ml-6 sm:flex sm:space-x-8">
                 <button
